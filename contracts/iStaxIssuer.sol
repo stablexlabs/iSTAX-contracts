@@ -64,8 +64,6 @@ contract iStaxIssuer is Ownable {
     uint256 public firstBonusEndBlock;
     // iStax tokens created per block (suggested 2, will be multiplied by BONUS_MULTIPLIER)
     uint256 public constant iStaxPerBlock = 2;
-    // minimum iSTAX tokens created per block (suggested 1)
-      uint256 public constant MiniStaxPerBlock = 1;
     // Bonus muliplier for early iStax earners.
     uint256 public constant BONUS_MULTIPLIER = 8;
     // The migrator contract. It has a lot of power. Can only be set through governance (owner).
@@ -86,6 +84,7 @@ contract iStaxIssuer is Ownable {
     event Deposit(address indexed user, uint256 indexed pid, uint256 amount);
     event Withdraw(address indexed user, uint256 indexed pid, uint256 amount);
     event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount);
+    event EmergencyErc20Retrieve(address indexed user, uint256 amount);
 
     constructor(
         iStaxToken _iStax,
@@ -162,57 +161,61 @@ contract iStaxIssuer is Ownable {
 
     // Return reward multiplier over the given _from to _to block.
     // Modified from original sushiswap code to allow for halving logic
-    function getMultiplier(uint256 _from, uint256 _to) public view returns (uint256 accruedAmount) {
+    function getMultiplier(uint256 _from, uint256 _to) public view returns (uint256 totalAccruedAmount) {
 
         require(_from <= _to, "impossible timerange");
         uint256 endRewardsBlock = firstBonusEndBlock.add(halvingDuration.mul(BONUS_MULTIPLIER.mod(2)) // Assume bonus multiplier will be a multiple of 2
             );
-
+    // Handle the case in which the rewards are already fixed issuance and no decay 
         if (_from > endRewardsBlock) { // Expect this to be the most used logic so execute first for gas savings
-            (, accruedAmount) = _getMultiplierHelperFunction(_from, _to, _to, 1);
-            return;
+            (, totalAccruedAmount) = _getMultiplierHelperFunction(_from, _to, _to, 1); // rewards are constant at minimum multiplier.
+            return totalAccruedAmount;
         }
 
-        uint256 currEnd;
-        uint256 currMultiplier;
-        uint256 currAmount;
+        uint256 currEnd; // epoch end block
+        uint256 currMultiplier; //epoch issuanceMultiplier
+        uint256 currAmount; // Counter for current period rewards.
         uint256 currStart = Math.max(_from, startBlock);
         uint256 absoluteEnd = Math.min(_to, block.number);
         bool isDone = false;
 
         if (currStart < firstBonusEndBlock) {
             // This case is entered if we should start counting blocks from when BONUS_MULTIPLIER is still the initial value
-            (isDone, currAmount) += _getMultiplierHelperFunction(currStart, firstBonusEndBlock-1, absoluteEnd, BONUS_MULTIPLIER);
-            if (isDone) { return; }
-            currMultiplier = BONUS_MULTIPLIER;
-            currStart = firstBonusEndBlock;
-            currEnd = firstBonusEndBlock.add(halvingDuration).sub(1);
-            accruedAmount = currAmount;
+            // There can be two types here: if the end stops before this end of the firstBonus, and we can exit
+            (isDone, currAmount) = _getMultiplierHelperFunction(currStart, firstBonusEndBlock, absoluteEnd, BONUS_MULTIPLIER);
+
+            if (isDone) { 
+                totalAccruedAmount = currAmount; //update totalAccruedAmount and return (skip the rest of the loops)
+                return totalAccruedAmount; }
+            currMultiplier = BONUS_MULTIPLIER.div(2); //decrement next currMultiplier by half
+            currStart = firstBonusEndBlock; //reset the next start block to the beginning of the endblock.
+            currEnd = firstBonusEndBlock.add(halvingDuration); //.reset next currEnd to increment by halvingDuration
+            totalAccruedAmount = currAmount; // set our totalAccruedAmount to the initial currAmount
         } else {
             // This case is entered if we should start counting blocks from when BONUS_MULTIPLIER is not still the initial value, but not 1
             uint256 numHalvingDurationsPassed = firstBonusEndBlock.sub(currStart).div(halvingDuration); // Truncates during division
-            currMultiplier = Math.max(1, currMultiplier.div((2 ** numHalvingDurationsPassed)));
-            // TO-DO Check why sub1 here
-            currEnd = currStart.add(halvingDuration.mul(numHalvingDurationsPassed)).sub(1);
+            currMultiplier = Math.max(1, currMultiplier.div((2 ** numHalvingDurationsPassed))); // Updates currMultiplier
+            currEnd = currStart.add(halvingDuration.mul(numHalvingDurationsPassed)); // updates relevant currEnd spot.
         }
 
         while(!isDone) {
-            // Iterate through to accrue the values to the accruedAmount that is eventually returned
+            // Iterate through to accrue the values to the totalAccruedAmount that is eventually returned
             // Each time we iterate, we have to reduce the multiplier by 2 to simulate the halving.
             // We then adjust the next start-time range to add the halvingDuration, and 
             // check if the multiplier has reached 1 yet.
-            (isDone, accruedAmount) = _getMultiplierHelperFunction(currStart, currEnd, absoluteEnd, currMultiplier);
-            currMultiplier = currMultiplier.div(2);
-            currStart = currStart.add(halvingDuration);
-            currEnd = currMultiplier == 1 ? absoluteEnd : currEnd.add(halvingDuration);
-            accruedAmount = accruedAmount.add(currAmount);
+            (isDone, currAmount) = _getMultiplierHelperFunction(currStart, currEnd, absoluteEnd, currMultiplier);
+            currMultiplier = Math.max(1, currMultiplier.div(2)); // Halve the currMultiplier, but ensure a floor of 1
+            currStart = currStart.add(halvingDuration); // Increment by the halving duration
+            currEnd = currMultiplier == 1 ? absoluteEnd : currEnd.add(halvingDuration); // Increment by halving duration but check for end
+            totalAccruedAmount = totalAccruedAmount.add(currAmount);  // Update our totalAccruedAmount and loop again
         }
 
-        return;
+        return totalAccruedAmount;
     }
     // Helper function that returns both a boolean of whether or not we've reached the end, and a reward calculator for the duration * multiplier
     // Returns boolean of if we have hit the end of the rewards, and the amount of rewards accrued in the contract
-    function _getMultiplierHelperFunction(uint256 _currStart, uint256 _currEnd, uint256 _absoluteEnd, uint256 _multiplier) internal view returns (bool, uint) {
+    // This function is pure because it doesnt need to view or update storage
+    function _getMultiplierHelperFunction(uint256 _currStart, uint256 _currEnd, uint256 _absoluteEnd, uint256 _multiplier) internal pure returns (bool, uint) {
         return (
           _currEnd >= _absoluteEnd,
           Math.min(_currEnd, _absoluteEnd).sub(_currStart).mul(_multiplier)
@@ -221,7 +224,7 @@ contract iStaxIssuer is Ownable {
 
 
     // This function is only used as a View function to see pending iStaxs on frontend.
-
+    // no changes from Sushi
     function pendingiStax(uint256 _pid, address _user) external view returns (uint256) {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
@@ -306,6 +309,7 @@ contract iStaxIssuer is Ownable {
 
     // Users may call this Withdraw without caring about rewards. EMERGENCY ONLY.
     // Accrued rewards are lost when this option is chosen.
+    // No changes from Sushi 
     function emergencyWithdraw(uint256 _pid) external {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
@@ -317,6 +321,7 @@ contract iStaxIssuer is Ownable {
 
     }
 
+
     // Safe iStax transfer function, just in case if rounding error causes pool to not have enough iStaxs.
     // Utilised by the pool itself (hence internal) to transfer funds to the miners.
     function safeiStaxTransfer(address _to, uint256 _amount) internal {
@@ -327,6 +332,16 @@ contract iStaxIssuer is Ownable {
             iStax.transfer(_to, _amount);
         }
     }
+
+    // EMERGENCY ERC20 Rescue ONLY - withdraw all erroneous sent in to this address. 
+    // cannot withdraw iSTAX in the contract, this ensures that owner does not have a way to touch iSTAX tokens 
+    // in this contract inappropriately
+    function emergencyErc20Retrieve(address token) external onlyOwner {
+        require(token != address(iStax)); // only allow retrieval for noniSTAX tokens
+        IERC20(token).safeTransfer(address(msg.sender), IERC20(token).balanceOf(address(this))); // helps remove all 
+        emit EmergencyErc20Retrieve(address(msg.sender), IERC20(token).balanceOf(address(this)));
+    }
+
 
     // Update dev address by the previous dev.
     function dev(address _devaddr) public {
